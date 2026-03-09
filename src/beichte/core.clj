@@ -81,6 +81,35 @@
                         }))
 
 
+;; ================================================================
+;; Public API for modifying the purity registry
+;; ================================================================
+
+(defn register-pure!
+  "Mark one or more entries as pure.
+  Accepts vars, [class method] pairs, or class name strings.
+  Examples:
+    (register-pure! #'my.ns/my-fn)
+    (register-pure! [\"java.lang.Math\" 'sin])
+    (register-pure! \"java.lang.Math\")"
+  [& entries]
+  (doseq [e entries]
+    (swap! pure-ground assoc e true))
+  nil)
+
+(defn register-impure!
+  "Mark one or more entries as impure.
+  Accepts vars, [class method] pairs, or class name strings."
+  [& entries]
+  (doseq [e entries]
+    (swap! pure-ground assoc e false))
+  nil)
+
+(defn pure?
+  "Check if an entry is registered as pure."
+  [entry]
+  (true? (get @pure-ground entry)))
+
 (declare impure?)
 
 (defn impure-var? [visited ast]
@@ -189,7 +218,41 @@
                           (impure-var? visited ast))
                :var (if (visited (:var ast))
                       nil
-                      (impure-var? visited ast)))]
+                      (impure-var? visited ast))
+               ;; Static fields (e.g. Math/PI) — pure read
+               :static-field false
+               ;; Instance fields — impure (mutable state access)
+               :instance-field {:problem :instance-field-access
+                                :class (:class ast)
+                                :field (:field ast)
+                                :form (:form ast)}
+               ;; with-meta — pure if expr and meta are pure
+               :with-meta (or (impure? visited (:expr ast))
+                              (impure? visited (:meta ast)))
+               ;; host-interop — treated like invoke
+               :host-interop (some-impure? visited args)
+               ;; keyword-invoke — pure
+               :keyword-invoke (some-impure? visited args)
+               ;; protocol-invoke — check args (protocol method purity unknown)
+               :protocol-invoke (some-impure? visited args)
+               ;; prim-invoke — check args
+               :prim-invoke (some-impure? visited args)
+               ;; monitor-enter/exit — impure
+               :monitor-enter {:problem :synchronization :form (:form ast)}
+               :monitor-exit {:problem :synchronization :form (:form ast)}
+               ;; throw — impure (control flow effect)
+               :throw {:problem :throw :form (:form ast)}
+               ;; set! — impure (mutation)
+               :set! {:problem :mutation :form (:form ast)}
+               ;; case — check test + branches
+               :case (or (impure? visited (:test ast))
+                         (some-impure? visited (:thens ast))
+                         (impure? visited (:default ast)))
+               ;; letfn — check bindings + body
+               :letfn (or (some-impure? visited (:bindings ast))
+                          (impure? visited (:body ast)))
+               ;; method — fn method body
+               :method (impure? visited (:body ast)))]
      (if res
        {:form (:form ast)
         :subform res}
