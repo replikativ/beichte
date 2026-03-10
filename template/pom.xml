@@ -9,8 +9,8 @@
     <description>Static effect inference for Clojure — no type system required.</description>
     <licenses>
         <license>
-            <name>Eclipse</name>
-            <url>http://www.eclipse.org/legal/epl-v10.html</url>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0</url>
         </license>
     </licenses>
     <scm>
