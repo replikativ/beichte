@@ -22,7 +22,7 @@ target before transforming it.
 
 ```clojure
 ;; deps.edn
-{:deps {io.replikativ/beichte {:mvn/version "0.2.XXXX"} ;; see Clojars for latest}}
+{:deps {org.replikativ/beichte {:mvn/version "LATEST"}}}
 ```
 
 ```clojure
@@ -165,11 +165,6 @@ Extend the default registry with domain-specific annotations:
 - **`beichte.analyze`** — AST-walking effect inference engine
 - **`beichte.core`** — Public API (delegates to the above)
 
-## Backwards Compatibility
-
-The legacy `impure?` / `pure-ground` / `register-pure!` API still works.
-New code should use `analyze`, `analyze-var`, and `analyze-ns` instead.
-
 ## Requirements
 
 - **JDK 11+**
@@ -179,5 +174,4 @@ New code should use `analyze`, `analyze-var`, and `analyze-ns` instead.
 
 Copyright © 2017–2026 Christian Weilbach
 
-Distributed under the Eclipse Public License either version 1.0 or (at
-your option) any later version.
+Licensed under the Apache License, Version 2.0.
