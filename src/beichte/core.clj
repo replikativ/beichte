@@ -1,299 +1,201 @@
 (ns beichte.core
-  (:require [clojure.tools.analyzer :as ana]
-            [clojure.tools.analyzer.env :as env]
-            [clojure.tools.analyzer.jvm :as jvm]
-            [clojure.java.io :as io])
-  (:import (java.io LineNumberReader InputStreamReader PushbackReader)
-           (clojure.lang RT Reflector)))
+  "Static effect inference for Clojure — no type system required.
 
+  Beichte (German: to confess) analyzes Clojure code via tools.analyzer.jvm
+  and infers side-effect levels on a four-point lattice:
 
-;; taken from clojure.repl
-(defn source-var
-  "Returns a string of the source code for the given symbol, if it can
-  find it.  This requires that the symbol resolve to a Var defined in
-  a namespace for which the .clj is in the classpath.  Returns nil if
-  it can't find the source.  For most REPL usage, 'source' is more
-  convenient.
-  Example: (source-fn 'filter)"
-  [v]
-  (if-let [filepath (:file (meta v))]
-    (if-let [strm (or (.getResourceAsStream (RT/baseLoader) filepath)
-                        ;; fall back to filesystem for dev
-                        (io/input-stream filepath))]
-      (with-open [rdr (LineNumberReader. (InputStreamReader. strm))]
-        (dotimes [_ (dec (:line (meta v)))] (.readLine rdr))
-        (let [text (StringBuilder.)
-              pbr (proxy [PushbackReader] [rdr]
-                    (read [] (let [i (proxy-super read)]
-                               (.append text (char i))
-                               i)))
-              read-opts (if (.endsWith ^String filepath "cljc") {:read-cond :allow} {})]
-          (if (= :unknown *read-eval*)
-            (throw (IllegalStateException. "Unable to read source while *read-eval* is :unknown."))
-            (read read-opts (PushbackReader. pbr))) (str text)))
-      {:problem :cannot-open-stream
-       :var v :file filepath})
-    {:problem :file-not-found
-     :var v :meta (meta v)}))
+    :pure < :local < :mutation < :io
 
+  Designed for compiler builders: validate that code is safe for AD,
+  GPU compilation, parallelization, or CSE before transforming it.
 
-(comment
-  (source-var (:var (jvm/analyze 'clojure.core/*print-readably* (ana/empty-env)))))
+  Quick start:
 
-(def pure-ground (atom {#'clojure.core/*print-readably* true
-                        #'clojure.core/*print-dup* true
-                        #'clojure.core/*out* false
-                        #'clojure.core/pr true
+    (require '[beichte.core :as b])
 
-                        #'clojure.core/cons true ;; breaks recursion
-                        #'clojure.core/first true
-                        #'clojure.core/rest true
-                        #'clojure.core/spread true
+    ;; Analyze expressions (fresh analysis each call — safe for REPL)
+    (b/analyze '(+ 1 2))              ;; => :pure
+    (b/analyze '(swap! a inc))        ;; => :mutation
+    (b/analyze '(println \"hi\"))     ;; => :io
+    (b/analyze '(aset arr 0 42))      ;; => :local
 
-                        ;; classes
-                        "Exception" true
-                        "clojure.lang.LazySeq" true
-                        "clojure.lang.ChunkBuffer" true
-                        "clojure.lang.ChunkedCons" true
+    ;; Full descriptors with feature flags
+    (b/analyze-full '(throw (Exception. \"x\")))
+    ;; => {:effect :pure, :flags #{:throws}}
 
-                        ;; instance calls
-                        ["clojure.lang.IFn" 'applyTo] true
-                        ["clojure.lang.Var" 'pushThreadBindings] true
-                        ["clojure.lang.Var" 'popThreadBindings] true
-                        ["clojure.lang.PersistentHashMap" 'create] true
-                        ["clojure.lang.IChunkedSeq" 'chunkedFirst] true
-                        ["clojure.lang.IChunkedSeq" 'chunkedMore] true
-                        ["clojure.lang.Numbers" 'add] true
-                        ["clojure.lang.Numbers" 'inc] true
-                        ["clojure.lang.Numbers" 'lt] true
-                        ["clojure.lang.Numbers" 'unchecked_inc] true
-                        ["clojure.lang.Numbers" 'isZero] true
-                        ["clojure.lang.Util" 'identical] true
-                        ["clojure.lang.RT" 'seq] true
-                        ["clojure.lang.RT" 'intCast] true
-                        ["clojure.lang.RT" 'longCast] true
-                        ["clojure.lang.RT" 'count] true
-                        ["clojure.lang.RT" 'next] true
-                        ["clojure.lang.RT" 'conj] true
-                        ["clojure.lang.ChunkBuffer" 'add] true
-                        ["clojure.lang.ChunkBuffer" 'chunk] true
-                        ["clojure.lang.Indexed" 'nth] true
-                        }))
+    ;; Check if code is safe for a compilation target
+    (b/compilable? :gpu '(+ 1 2))     ;; => true
+    (b/compilable? :gpu '(throw (Exception. \"x\")))  ;; => false
 
+    ;; Compiler pipelines: create a context to cache across calls
+    (let [ctx (b/make-context)]
+      (b/analyze '(foo x) ctx)      ;; analyzes foo from source
+      (b/analyze '(bar (foo x)) ctx) ;; foo already cached
+      (b/analyze-var #'baz ctx))     ;; works for vars too
+
+  See beichte.effect for the lattice and flags, beichte.registry for
+  the pre-annotated clojure.core entries, and beichte.analyze for the
+  AST-walking inference engine."
+  (:require [beichte.effect :as effect]
+            [beichte.registry :as registry]
+            [beichte.analyze :as ana]))
 
 ;; ================================================================
-;; Public API for modifying the purity registry
+;; Context (explicit, opt-in caching)
 ;; ================================================================
 
-(defn register-pure!
-  "Mark one or more entries as pure.
-  Accepts vars, [class method] pairs, or class name strings.
-  Examples:
-    (register-pure! #'my.ns/my-fn)
-    (register-pure! [\"java.lang.Math\" 'sin])
-    (register-pure! \"java.lang.Math\")"
-  [& entries]
-  (doseq [e entries]
-    (swap! pure-ground assoc e true))
-  nil)
+(defn make-context
+  "Create an analysis context that caches results across calls.
 
-(defn register-impure!
-  "Mark one or more entries as impure.
-  Accepts vars, [class method] pairs, or class name strings."
-  [& entries]
-  (doseq [e entries]
-    (swap! pure-ground assoc e false))
-  nil)
+  For REPL use, omit the context — each call analyzes fresh.
+  For compiler pipelines, create one context per pass and reuse it.
 
-(defn pure?
-  "Check if an entry is registered as pure."
-  [entry]
-  (true? (get @pure-ground entry)))
+  Options:
+    :registry — custom effect registry (default: default-registry)"
+  ([] (ana/make-analysis))
+  ([{:keys [registry]}]
+   (if registry
+     (ana/make-analysis registry)
+     (ana/make-analysis))))
 
-(declare impure?)
+;; ================================================================
+;; Primary API
+;; ================================================================
 
-(defn impure-var? [visited ast]
-  (let [v (or (:var ast) (:the-var ast))
-        g (@pure-ground v)
-        res (cond (true? g) false
-                  (false? g)
-                  {:problem :impure-var-accessed
-                   :file (:file (meta v))
-                   :line (:line (meta v))
-                   :var v}
-                  :else
-                  (let [src (source-var v)]
-                    (if (map? src) ;; error
-                      src
-                      (-> src
-                          read-string
-                          (jvm/analyze (assoc (jvm/empty-env)
-                                              :ns (symbol (str (:ns (meta v))))))))))
-        res (impure? visited res)]
-    (swap! pure-ground assoc v (not res))
-    res))
+(defn analyze
+  "Infer the effect level of a Clojure expression.
 
+  Returns one of: :pure, :local, :mutation, :io
 
+  Without context: fresh analysis each call (safe for REPL).
+  With context: reuses cached var analysis results."
+  ([expr] (ana/analyze-expr expr {}))
+  ([expr ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     ;; It's a context from make-context
+     (ana/analyze-expr expr {:analysis ctx-or-opts})
+     ;; It's an opts map
+     (ana/analyze-expr expr ctx-or-opts))))
 
-(defn pure-class? [class]
-  (@pure-ground (pr-str class)))
+(defn analyze-full
+  "Infer the full effect descriptor of a Clojure expression.
 
-(defn pure-method? [class method]
-  (@pure-ground [(pr-str class) method]))
+  Returns {:effect :level, :flags #{...}} where flags are orthogonal
+  properties like :throws, :random, :reflects, :allocates."
+  ([expr] (ana/analyze-expr-full expr {}))
+  ([expr ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/analyze-expr-full expr {:analysis ctx-or-opts})
+     (ana/analyze-expr-full expr ctx-or-opts))))
 
-(defn some-impure? [visited args]
-  (some identity (map (partial impure? visited) args)))
+(defn analyze-var
+  "Infer the effect level of a var by analyzing its source.
 
+  Returns one of: :pure, :local, :mutation, :io"
+  ([v] (ana/analyze-var v {}))
+  ([v ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/analyze-var v {:analysis ctx-or-opts})
+     (ana/analyze-var v ctx-or-opts))))
 
-(defn impure?
-  ([ast]
-   (impure? #{} ast))
-  ([visited ast]
-   (let [{:keys [args op env form children] :as ast} ast
-         res (case op
-               nil nil ;; catch missing forms
-               :static-call (if (pure-method? (:class ast) (:method ast))
-                              (some-impure? visited args)
-                              {:problem :unsafe-static-instance-call
-                               :class (:class ast)
-                               :method (:method ast)
-                               :form (:form ast)})
-               :const (case (:type ast)
-                        :class (let [res (not (pure-class? (:form ast)))]
-                                 (if res
-                                   {:problem :unsafe-class-instantiated
-                                    :form (:form ast)}
-                                   res))
-                        :vector false
-                        :map false
-                        :set false
-                        :nil false
-                        :number false
-                        :keyword false
-                        :string false
-                        :bool false
-                        :constant false)
-               :def (impure? (conj visited (:var ast))
-                             ;; TODO why inconsistent?
-                             (or (-> ast :init :expr) (-> ast :init)))
-               :fn (some-impure? visited (:methods ast))
-               :fn-method (impure? visited (:body ast))
-               :do (or (some-impure? visited (:statements ast))
-                       (impure? visited (:ret ast)))
-               :local (when (:assignable? ast)
-                        {:problem :assignable-local
-                         :form (:form ast)})
-               :invoke (or (impure? visited (:fn ast))
-                           (some-impure? visited args))
-               :try (or (impure? visited (:body ast))
-                        (some-impure? visited (:catches ast))
-                        (impure? visited (:finally ast)))
-               :catch (or (impure? visited (:class ast))
-                          (impure? visited (:body ast)))
-               :instance? false
-               :let (or (some-impure? visited (:bindings ast))
-                        (impure? visited (:body ast))) 
-               :binding (impure? visited (:init ast))
-               :instance-call
-               (if (pure-method? (:class ast) (:method ast))
-                 (some-impure? visited args) 
-                 {:problem :unsafe-instance-call
-                  :class (:class ast)
-                  :method (:method ast)
-                  :form (:form ast)})
-               :loop (or (some-impure? visited (:bindings ast))
-                         (impure? visited (:body ast)))
-               :recur (some-impure? visited (:exprs ast))
-               :new (or (impure? visited (:class ast))
-                        (some-impure? visited args))
-               :if (or (impure? visited (:test ast))
-                       (impure? visited (:then ast))
-                       (impure? visited (:else ast)))
-               :vector (some-impure? visited (:items ast))
-               :set (some-impure? visited (:items ast))
-               :map (or (some-impure? visited (:keys ast))
-                        (some-impure? visited (:vals ast)))
-               :the-var (if (visited (:var ast))
-                          nil
-                          (impure-var? visited ast))
-               :var (if (visited (:var ast))
-                      nil
-                      (impure-var? visited ast))
-               ;; Static fields (e.g. Math/PI) — pure read
-               :static-field false
-               ;; Instance fields — impure (mutable state access)
-               :instance-field {:problem :instance-field-access
-                                :class (:class ast)
-                                :field (:field ast)
-                                :form (:form ast)}
-               ;; with-meta — pure if expr and meta are pure
-               :with-meta (or (impure? visited (:expr ast))
-                              (impure? visited (:meta ast)))
-               ;; host-interop — treated like invoke
-               :host-interop (some-impure? visited args)
-               ;; keyword-invoke — pure
-               :keyword-invoke (some-impure? visited args)
-               ;; protocol-invoke — check args (protocol method purity unknown)
-               :protocol-invoke (some-impure? visited args)
-               ;; prim-invoke — check args
-               :prim-invoke (some-impure? visited args)
-               ;; monitor-enter/exit — impure
-               :monitor-enter {:problem :synchronization :form (:form ast)}
-               :monitor-exit {:problem :synchronization :form (:form ast)}
-               ;; throw — impure (control flow effect)
-               :throw {:problem :throw :form (:form ast)}
-               ;; set! — impure (mutation)
-               :set! {:problem :mutation :form (:form ast)}
-               ;; case — check test + branches
-               :case (or (impure? visited (:test ast))
-                         (some-impure? visited (:thens ast))
-                         (impure? visited (:default ast)))
-               ;; letfn — check bindings + body
-               :letfn (or (some-impure? visited (:bindings ast))
-                          (impure? visited (:body ast)))
-               ;; method — fn method body
-               :method (impure? visited (:body ast)))]
-     (if res
-       {:form (:form ast)
-        :subform res}
-       res))))
+(defn analyze-var-full
+  "Infer the full effect descriptor of a var.
 
+  Returns {:effect :level, :flags #{...}}."
+  ([v] (ana/analyze-var-full v {}))
+  ([v ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/analyze-var-full v {:analysis ctx-or-opts})
+     (ana/analyze-var-full v ctx-or-opts))))
 
-(defn foo
-  "I don't do a whole lot."
-  [x]
-  (println x "Hello, World!"))
+(defn analyze-ns
+  "Analyze all public vars in a namespace.
 
+  Returns {var → effect-level}."
+  ([ns-sym] (ana/analyze-ns ns-sym {}))
+  ([ns-sym ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/analyze-ns ns-sym {:analysis ctx-or-opts})
+     (ana/analyze-ns ns-sym ctx-or-opts))))
 
+(defn analyze-ns-full
+  "Analyze all public vars and return {var → descriptor}."
+  ([ns-sym] (ana/analyze-ns-full ns-sym {}))
+  ([ns-sym ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/analyze-ns-full ns-sym {:analysis ctx-or-opts})
+     (ana/analyze-ns-full ns-sym ctx-or-opts))))
 
+(defn compilable?
+  "True if an expression is within the effect budget for a compilation target.
 
+  Checks both state effect budget and feature flag support.
 
-(comment
-  (impure? (jvm/analyze '{:a (inc 1)} (jvm/empty-env)))
+  Targets and their budgets:
+    :ad, :cse       — :pure (no effects at all)
+    :gpu, :simd     — :local (thread-local mutation OK)
+    :parallel       — :local
+    :sequential     — :io (anything goes)
+    :inline         — :io (anything goes)
 
-  (impure? (jvm/analyze '(map (fn [x] (+ 1 x)) [1 2 (inc 3)]) (jvm/empty-env)))
+  GPU also rejects :throws and :reflects flags."
+  ([target expr] (ana/compilable? target expr {}))
+  ([target expr ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/compilable? target expr {:analysis ctx-or-opts})
+     (ana/compilable? target expr ctx-or-opts))))
 
-  (impure? (jvm/analyze '(foo 42) (jvm/empty-env)))
+(defn filter-compilable
+  "Filter vars to those within the effect budget for a compilation target."
+  ([target vars] (ana/filter-compilable target vars {}))
+  ([target vars ctx-or-opts]
+   (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
+     (ana/filter-compilable target vars {:analysis ctx-or-opts})
+     (ana/filter-compilable target vars ctx-or-opts))))
 
-  (env/with-env (jvm/global-env)
-    (jvm/analyze 'println (jvm/empty-env) #_(env/deref-env)))
+;; ================================================================
+;; Effect lattice (re-exported for convenience)
+;; ================================================================
 
-  (impure? (jvm/analyze '(try 1 (catch Exception e)) (jvm/empty-env)))
+(def levels
+  "Effect levels in ascending order: [:pure :local :mutation :io]"
+  effect/levels)
 
-  (jvm/analyze '(try 1 (catch Exception e)) (jvm/empty-env))
+(def flags
+  "Known feature flags: #{:throws :random :reflects :allocates}"
+  effect/known-flags)
 
+(defn join
+  "Least upper bound of two effects."
+  [a b]
+  (effect/join a b))
 
-  (impure? (jvm/analyze '(let [a 1] a) (jvm/empty-env)))
+(defn within-budget?
+  "True if effect level is at most as effectful as budget."
+  [budget eff]
+  (effect/within-budget? budget eff))
 
-  (impure? (jvm/analyze '(java.util.UUID/randomUUID) (jvm/empty-env)))
+(defn budget-for
+  "Return the effect budget for a compilation target."
+  [target]
+  (effect/budget-for target))
 
-  (->
-   (source-var #'clojure.core/println)
-   read-string
-   (jvm/analyze (jvm/empty-env))
-   prn))
+;; ================================================================
+;; Registry management
+;; ================================================================
 
+(defn default-registry
+  "Return the default registry with pre-annotated clojure.core and Java entries."
+  []
+  (registry/default-registry))
 
+(defn make-registry
+  "Create a custom registry from a map of {entry → effect-level}.
+  Entries can be vars, [class method] pairs, or class name strings."
+  [entries]
+  (registry/make-registry entries))
 
-
-
+(defn extend-registry
+  "Extend a registry with additional entries."
+  [reg entries]
+  (registry/with-entries reg entries))

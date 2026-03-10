@@ -8,4 +8,15 @@
          :extra-deps {io.github.cognitect-labs/test-runner
                       {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
          :main-opts ["-m" "cognitect.test-runner"]
-         :exec-fn cognitect.test-runner.api/test}}}
+         :exec-fn cognitect.test-runner.api/test}
+  :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+           :main-opts ["-m" "cljfmt.main" "check" "src" "test"]}
+  :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+         :main-opts ["-m" "cljfmt.main" "fix" "src" "test"]}
+  :build {:deps {io.github.clojure/tools.build          {:mvn/version "0.10.6"}
+                 slipset/deps-deploy                    {:mvn/version "0.2.2"}
+                 io.github.borkdude/gh-release-artifact {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}
+                 babashka/babashka.curl                 {:mvn/version "0.1.2"}
+                 babashka/fs                            {:mvn/version "0.3.17"}
+                 cheshire/cheshire                      {:mvn/version "5.11.0"}}
+          :ns-default build}}}
