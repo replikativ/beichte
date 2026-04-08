@@ -461,10 +461,10 @@
   (let [local-map (if (map? locals)
                     locals
                     (into {} (map (fn [s]
-                                   [(symbol (name s))
-                                    {:op :binding :name (symbol (name s))
-                                     :form (symbol (name s)) :local :let}])
-                                 locals)))
+                                    [(symbol (name s))
+                                     {:op :binding :name (symbol (name s))
+                                      :form (symbol (name s)) :local :let}])
+                                  locals)))
         env (cond-> (assoc (jvm/empty-env) :ns (symbol ns-str))
               (seq local-map) (assoc :locals local-map))
         wrapped `(fn [] ~expr)]
