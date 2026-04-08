@@ -68,25 +68,42 @@
   Returns one of: :pure, :local, :mutation, :io
 
   Without context: fresh analysis each call (safe for REPL).
-  With context: reuses cached var analysis results."
+  With context: reuses cached var analysis results.
+
+  Options (as second arg or merged with context):
+    :locals — set of symbols to treat as locally-bound (compiler IR support)"
   ([expr] (ana/analyze-expr expr {}))
   ([expr ctx-or-opts]
    (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
-     ;; It's a context from make-context
-     (ana/analyze-expr expr {:analysis ctx-or-opts})
+     ;; It's a context from make-context — pass :locals if present
+     (ana/analyze-expr expr (cond-> {:analysis ctx-or-opts}
+                              (:locals ctx-or-opts) (assoc :locals (:locals ctx-or-opts))))
      ;; It's an opts map
-     (ana/analyze-expr expr ctx-or-opts))))
+     (ana/analyze-expr expr ctx-or-opts)))
+  ([expr ctx locals]
+   (ana/analyze-expr expr (cond-> (if (and (map? ctx) (:cache ctx))
+                                    {:analysis ctx}
+                                    (or ctx {}))
+                            locals (assoc :locals locals)))))
 
 (defn analyze-full
   "Infer the full effect descriptor of a Clojure expression.
 
   Returns {:effect :level, :flags #{...}} where flags are orthogonal
-  properties like :throws, :random, :reflects, :allocates."
+  properties like :throws, :random, :reflects, :allocates.
+
+  Options: same as analyze, including :locals for compiler IR."
   ([expr] (ana/analyze-expr-full expr {}))
   ([expr ctx-or-opts]
    (if (and (map? ctx-or-opts) (:cache ctx-or-opts))
-     (ana/analyze-expr-full expr {:analysis ctx-or-opts})
-     (ana/analyze-expr-full expr ctx-or-opts))))
+     (ana/analyze-expr-full expr (cond-> {:analysis ctx-or-opts}
+                                   (:locals ctx-or-opts) (assoc :locals (:locals ctx-or-opts))))
+     (ana/analyze-expr-full expr ctx-or-opts)))
+  ([expr ctx locals]
+   (ana/analyze-expr-full expr (cond-> (if (and (map? ctx) (:cache ctx))
+                                         {:analysis ctx}
+                                         (or ctx {}))
+                                 locals (assoc :locals locals)))))
 
 (defn analyze-var
   "Infer the effect level of a var by analyzing its source.

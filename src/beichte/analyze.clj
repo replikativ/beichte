@@ -454,9 +454,21 @@
 ;; High-level API
 ;; ================================================================
 
-(defn- make-ast [expr ns-str]
-  (let [wrapped `(fn [] ~expr)]
-    (jvm/analyze wrapped (assoc (jvm/empty-env) :ns (symbol ns-str)))))
+(defn- make-ast
+  "Build an AST for an expression, optionally with local bindings.
+  locals: a set or seq of symbols to treat as locally-bound (won't fail on resolve)."
+  [expr ns-str locals]
+  (let [local-map (if (map? locals)
+                    locals
+                    (into {} (map (fn [s]
+                                   [(symbol (name s))
+                                    {:op :binding :name (symbol (name s))
+                                     :form (symbol (name s)) :local :let}])
+                                 locals)))
+        env (cond-> (assoc (jvm/empty-env) :ns (symbol ns-str))
+              (seq local-map) (assoc :locals local-map))
+        wrapped `(fn [] ~expr)]
+    (jvm/analyze wrapped env)))
 
 (defn- resolve-analysis
   "Resolve an analysis context from opts. If :analysis is provided, use it.
@@ -474,22 +486,29 @@
   opts may include:
     :analysis — reuse a context from make-analysis (for caching)
     :registry — custom registry (ignored if :analysis given)
-    :ns       — namespace context (default: *ns*)"
+    :ns       — namespace context (default: *ns*)
+    :locals   — set or seq of symbols to treat as locally-bound"
   ([expr] (analyze-expr expr {}))
   ([expr opts]
    (let [ns-str (or (:ns opts) (str (clojure.core/ns-name *ns*)))
          analysis (resolve-analysis opts)
-         ast (make-ast expr ns-str)]
+         ast (make-ast expr ns-str (:locals opts))]
      (infer-effect analysis ast))))
 
 (defn analyze-expr-full
   "Analyze an S-expression and return its full effect descriptor.
-  Returns {:effect :level, :flags #{...}}."
+  Returns {:effect :level, :flags #{...}}.
+
+  opts may include:
+    :analysis — reuse a context from make-analysis (for caching)
+    :registry — custom registry (ignored if :analysis given)
+    :ns       — namespace context (default: *ns*)
+    :locals   — set or seq of symbols to treat as locally-bound"
   ([expr] (analyze-expr-full expr {}))
   ([expr opts]
    (let [ns-str (or (:ns opts) (str (clojure.core/ns-name *ns*)))
          analysis (resolve-analysis opts)
-         ast (make-ast expr ns-str)]
+         ast (make-ast expr ns-str (:locals opts))]
      (infer-descriptor analysis ast))))
 
 (defn analyze-var
