@@ -221,16 +221,99 @@
 (deftest effect-descriptors
   (testing "effect-join combines levels and flags"
     (let [a (effect/effect :pure #{:throws})
-          b (effect/effect :local #{:random})]
-      (is (= {:effect :local :flags #{:throws :random}}
-             (effect/effect-join a b)))))
+          b (effect/effect :local #{:random})
+          joined (effect/effect-join a b)]
+      (is (= :local (:effect joined)))
+      (is (= #{:throws :random} (:flags joined)))
+      (is (= #{} (:writes joined)))))
 
   (testing "effect-join-all"
     (is (= effect/pure (effect/effect-join-all [])))
-    (is (= {:effect :io :flags #{:throws}}
-           (effect/effect-join-all
-            [(effect/effect :pure #{:throws})
-             (effect/effect :io)])))))
+    (let [joined (effect/effect-join-all
+                  [(effect/effect :pure #{:throws})
+                   (effect/effect :io)])]
+      (is (= :io (:effect joined)))
+      (is (= #{:throws} (:flags joined))))))
+
+;; ================================================================
+;; Scope-aware write tracking
+;; ================================================================
+
+(deftest scope-aware-scratch-arrays
+  (testing "scratch array: write to fresh local that doesn't escape → :pure"
+    (is (= :pure (:effect (b/analyze-full
+                           '(fn [x] (let [tmp (double-array 1)]
+                                      (clojure.core/aset tmp 0 (* x x))
+                                      (clojure.core/aget tmp 0))))))))
+
+  (testing "nested scratch: inner let scope resolves independently"
+    (is (= :pure (:effect (b/analyze-full
+                           '(fn [x] (let [result (let [tmp (double-array 1)]
+                                                   (clojure.core/aset tmp 0 x)
+                                                   (clojure.core/aget tmp 0))]
+                                      result)))))))
+
+  (testing "multiple scratch arrays: all invisible"
+    (is (= :pure (:effect (b/analyze-full
+                           '(fn [x y] (let [a (double-array 1)
+                                            b (double-array 1)]
+                                        (clojure.core/aset a 0 x)
+                                        (clojure.core/aset b 0 y)
+                                        (+ (clojure.core/aget a 0)
+                                           (clojure.core/aget b 0))))))))))
+
+(deftest scope-aware-construction
+  (testing "fresh array returned: write to fresh that escapes → :local"
+    (is (= :local (:effect (b/analyze-full
+                            '(fn [n] (let [out (double-array n)]
+                                       (clojure.core/aset out 0 42.0)
+                                       out)))))))
+
+  (testing "loop-filled array returned: construction pattern → :local"
+    (is (= :local (:effect (b/analyze-full
+                            '(fn [n] (let [out (double-array n)]
+                                       (loop [i 0]
+                                         (when (< i n)
+                                           (clojure.core/aset out i (double i))
+                                           (recur (inc i))))
+                                       out)))))))
+
+  (testing "conditional return of fresh array → :local (may escape)"
+    (is (= :local (:effect (b/analyze-full
+                            '(fn [n] (let [out (double-array n)]
+                                       (clojure.core/aset out 0 1.0)
+                                       (if (> n 0) out nil)))))))))
+
+(deftest scope-aware-param-mutation
+  (testing "write to parameter → :mutation"
+    (is (= :mutation (:effect (b/analyze-full
+                               '(fn [param] (clojure.core/aset param 0 42.0) param))))))
+
+  (testing "alias to param → :mutation (follows alias chain)"
+    (is (= :mutation (:effect (b/analyze-full
+                               '(fn [arr] (let [alias arr]
+                                            (clojure.core/aset alias 0 42.0)
+                                            alias)))))))
+
+  (testing "swap! on param → :mutation"
+    (is (= :mutation (:effect (b/analyze-full
+                               '(fn [a] (swap! a inc))))))))
+
+(deftest scope-aware-transients
+  (testing "transient construction: conj! into fresh transient → :local"
+    ;; transient creates fresh, conj! writes to it, persistent! returns
+    (is (= :local (:effect (b/analyze-full
+                            '(fn [xs] (persistent! (conj! (transient []) 1)))))))))
+
+(deftest scope-aware-no-writes
+  (testing "pure arithmetic unchanged"
+    (is (= :pure (:effect (b/analyze-full '(fn [x y] (+ x y)))))))
+
+  (testing "println still :io"
+    (is (= :io (:effect (b/analyze-full '(fn [] (println "hello")))))))
+
+  (testing "map/filter still :pure"
+    (is (= :pure (:effect (b/analyze-full '(fn [xs] (map inc xs))))))))
 
 ;; ================================================================
 ;; Context (explicit caching)
