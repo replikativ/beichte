@@ -217,8 +217,8 @@
     :static-call
     (when (and (contains? write-target-methods
                           [(pr-str (:class ast)) (:method ast)])
-              (seq (:args ast))
-              (= :local (:op (first (:args ast)))))
+               (seq (:args ast))
+               (= :local (:op (first (:args ast)))))
       (:name (first (:args ast))))
 
     :invoke
