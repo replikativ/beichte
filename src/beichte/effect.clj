@@ -86,25 +86,37 @@
 ;; ================================================================
 
 (defn effect
-  "Create an effect descriptor: {:effect level, :flags #{...}}.
-  Shorthand: (effect :pure) or (effect :local #{:throws})."
-  ([level] {:effect level :flags #{}})
-  ([level flags] {:effect level :flags (set flags)}))
+  "Create an effect descriptor: {:effect level, :flags #{...}, :writes #{...}}.
+  Shorthand: (effect :pure) or (effect :local #{:throws}).
+  The :writes set tracks which binding names are written to during analysis;
+  it is resolved at scope boundaries (let, fn) and cleared before returning
+  to callers.  See beichte.analyze for the scope-aware resolution logic."
+  ([level] {:effect level :flags #{} :writes #{}})
+  ([level flags] {:effect level :flags (set flags) :writes #{}})
+  ([level flags writes] {:effect level :flags (set flags) :writes (set writes)}))
 
 (def pure
-  "The pure effect descriptor (no effects, no flags)."
+  "The pure effect descriptor (no effects, no flags, no writes)."
   (effect :pure))
 
 (defn effect-join
-  "Join two effect descriptors (component-wise max / union)."
+  "Join two effect descriptors (component-wise max / union).
+  Writes are unioned — scope resolution happens at let/fn boundaries."
   [a b]
   {:effect (join (:effect a :pure) (:effect b :pure))
-   :flags  (flags-join (:flags a) (:flags b))})
+   :flags  (flags-join (:flags a) (:flags b))
+   :writes (into (or (:writes a) #{}) (:writes b))})
 
 (defn effect-join-all
   "Join a collection of effect descriptors."
   ([descs] (reduce effect-join pure descs))
   ([init descs] (reduce effect-join init descs)))
+
+(defn strip-writes
+  "Remove internal :writes tracking from a descriptor.
+  Call this when returning results across API boundaries."
+  [desc]
+  (dissoc desc :writes))
 
 ;; ================================================================
 ;; Budget checking
