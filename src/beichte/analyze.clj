@@ -42,7 +42,8 @@
                                  i)))
                 read-opts (if (.endsWith ^String filepath "cljc")
                             {:read-cond :allow} {})]
-            (read read-opts (PushbackReader. pbr))
+            (binding [*read-eval* false]
+              (read read-opts (PushbackReader. pbr)))
             (str text)))
         (catch Exception _ nil)))))
 
@@ -70,10 +71,39 @@
   - registry: immutable map of known effects (level or descriptor)
   - cache: atom of {entry -> effect-level}, populated during analysis"
   ([registry]
+   (make-analysis registry {}))
+  ([registry options]
    {:registry registry
-    :cache (atom {})})
+    :cache (atom {})
+    ;; An explicit nil forbids unowned filesystem/source expansion. A caller
+    ;; supplying a resolver owns its source selection; source lookup is not a
+    ;; certificate that the text still describes the current Var root.
+    :source-resolver (let [resolver (get options :source-resolver source-var)]
+                       (when-not (or (nil? resolver) (ifn? resolver))
+                         (throw (ex-info "Source resolver must be callable or nil"
+                                         {:reason :invalid-source-resolver})))
+                       resolver)})
   ([]
    (make-analysis (registry/default-registry))))
+
+(defn- analyze-var-source
+  "Analyze function declarations only, never replay type/protocol declarations.
+  This optional source facility may expand macros inside a function. Compilers
+  requiring owned IR must disable it, rather than treating source text as proof."
+  [{:keys [source-resolver]} v]
+  (when source-resolver
+    (try
+      (when-let [src (source-resolver v)]
+        (let [form (binding [*read-eval* false] (read-string src))
+              head (when (seq? form) (first form))
+              function? (or (contains? '#{defn defn- clojure.core/defn clojure.core/defn-} head)
+                            (and (contains? '#{def clojure.core/def} head)
+                                 (seq? (last form))
+                                 (contains? '#{fn fn* clojure.core/fn} (first (last form)))))]
+          (when function?
+            (jvm/analyze form (assoc (jvm/empty-env)
+                                     :ns (symbol (str (:ns (meta v)))))))))
+      (catch Exception _ nil))))
 
 (defn- cached-effect
   "Look up an entry's effect level, checking cache first, then registry.
@@ -128,20 +158,9 @@
   (let [v (or (:var ast) (:the-var ast))]
     (if-let [known (cached-effect analysis v)]
       known
-      ;; Not known — try to analyze source
-      (let [src (source-var v)]
-        (if (nil? src)
-          (cache-effect! analysis v :io)
-          (let [analyzed (try
-                           (-> src
-                               read-string
-                               (jvm/analyze (assoc (jvm/empty-env)
-                                                   :ns (symbol (str (:ns (meta v)))))))
-                           (catch Exception _ nil))]
-            (if analyzed
-              (let [eff (infer-effect analysis (conj visited v) analyzed)]
-                (cache-effect! analysis v eff))
-              (cache-effect! analysis v :io))))))))
+      (if-let [analyzed (analyze-var-source analysis v)]
+        (cache-effect! analysis v (infer-effect analysis (conj visited v) analyzed))
+        (cache-effect! analysis v :io)))))
 
 (defn infer-effect
   "Infer the effect level of an AST node.
@@ -184,9 +203,9 @@
 
          :local (if (:assignable? ast) :local :pure)
 
-         :invoke (effect/join
-                  (infer-effect analysis visited (:fn ast))
-                  (infer-effects-join analysis visited args))
+         (:invoke :prim-invoke) (effect/join
+                                 (infer-effect analysis visited (:fn ast))
+                                 (infer-effects-join analysis visited args))
 
          :try (effect/join-all
                [(infer-effect analysis visited (:body ast))
@@ -194,7 +213,7 @@
                 (infer-effect analysis visited (:finally ast))])
 
          :catch (infer-effect analysis visited (:body ast))
-         :instance? :pure
+         :instance? (infer-effect analysis visited (:target ast))
 
          :let (effect/join
                (infer-effects-join analysis visited (:bindings ast))
@@ -208,7 +227,9 @@
                key [class-str method]
                known (cached-effect analysis key)]
            (if known
-             (effect/join known (infer-effects-join analysis visited args))
+             (effect/join-all [known
+                               (infer-effect analysis visited (:instance ast))
+                               (infer-effects-join analysis visited args)])
              :io))
 
          :loop (effect/join
@@ -243,10 +264,13 @@
                      (infer-effect analysis visited (:expr ast))
                      (infer-effect analysis visited (:meta ast)))
 
-         :host-interop (infer-effects-join analysis visited args)
-         :keyword-invoke (infer-effects-join analysis visited args)
-         :protocol-invoke (infer-effects-join analysis visited args)
-         :prim-invoke (infer-effects-join analysis visited args)
+         :host-interop :io
+         :keyword-invoke (infer-effects-join analysis visited
+                                             [(:keyword ast) (:target ast)])
+         :protocol-invoke (effect/join-all
+                           [(infer-effect analysis visited (:protocol-fn ast))
+                            (infer-effect analysis visited (:target ast))
+                            (infer-effects-join analysis visited args)])
 
          :monitor-enter :mutation
          :monitor-exit :mutation
@@ -293,25 +317,11 @@
                      (contains? random-vars v) (conj :random))]
     (if-let [known (cached-descriptor analysis v)]
       (update known :flags into base-flags)
-      (let [src (source-var v)]
-        (if (nil? src)
-          (let [desc (effect/effect :io base-flags)]
-            (cache-effect! analysis v desc)
-            desc)
-          (let [analyzed (try
-                           (-> src
-                               read-string
-                               (jvm/analyze (assoc (jvm/empty-env)
-                                                   :ns (symbol (str (:ns (meta v)))))))
-                           (catch Exception _ nil))]
-            (if analyzed
-              (let [desc (infer-descriptor analysis (conj visited v) analyzed)
-                    desc (update desc :flags into base-flags)]
-                (cache-effect! analysis v desc)
-                desc)
-              (let [desc (effect/effect :io base-flags)]
-                (cache-effect! analysis v desc)
-                desc))))))))
+      (cache-effect! analysis v
+                     (if-let [analyzed (analyze-var-source analysis v)]
+                       (update (infer-descriptor analysis (conj visited v) analyzed)
+                               :flags into base-flags)
+                       (effect/effect :io base-flags))))))
 
 (defn infer-descriptor
   "Infer the full effect descriptor of an AST node.
@@ -362,9 +372,9 @@
                   (effect/effect :local)
                   effect/pure)
 
-         :invoke (effect/effect-join
-                  (infer-descriptor analysis visited (:fn ast))
-                  (infer-descriptors-join analysis visited args))
+         (:invoke :prim-invoke) (effect/effect-join
+                                 (infer-descriptor analysis visited (:fn ast))
+                                 (infer-descriptors-join analysis visited args))
 
          :try (effect/effect-join-all
                [(infer-descriptor analysis visited (:body ast))
@@ -372,7 +382,7 @@
                 (infer-descriptor analysis visited (:finally ast))])
 
          :catch (infer-descriptor analysis visited (:body ast))
-         :instance? effect/pure
+         :instance? (infer-descriptor analysis visited (:target ast))
 
          :let (effect/effect-join
                (infer-descriptors-join analysis visited (:bindings ast))
@@ -386,8 +396,10 @@
                key [class-str method]
                known-desc (cached-descriptor analysis key)
                method-desc (or known-desc (effect/effect :io))]
-           (effect/effect-join method-desc
-                               (infer-descriptors-join analysis visited args)))
+           (effect/effect-join-all
+            [method-desc
+             (infer-descriptor analysis visited (:instance ast))
+             (infer-descriptors-join analysis visited args)]))
 
          :loop (effect/effect-join
                 (infer-descriptors-join analysis visited (:bindings ast))
@@ -421,10 +433,15 @@
                      (infer-descriptor analysis visited (:expr ast))
                      (infer-descriptor analysis visited (:meta ast)))
 
-         :host-interop (infer-descriptors-join analysis visited args)
-         :keyword-invoke (infer-descriptors-join analysis visited args)
-         :protocol-invoke (infer-descriptors-join analysis visited args)
-         :prim-invoke (infer-descriptors-join analysis visited args)
+         :host-interop (effect/effect-join
+                        (effect/effect :io)
+                        (infer-descriptor analysis visited (:target ast)))
+         :keyword-invoke (infer-descriptors-join analysis visited
+                                                 [(:keyword ast) (:target ast)])
+         :protocol-invoke (effect/effect-join-all
+                           [(infer-descriptor analysis visited (:protocol-fn ast))
+                            (infer-descriptor analysis visited (:target ast))
+                            (infer-descriptors-join analysis visited args)])
 
          :monitor-enter (effect/effect :mutation)
          :monitor-exit (effect/effect :mutation)
@@ -473,11 +490,10 @@
 (defn- resolve-analysis
   "Resolve an analysis context from opts. If :analysis is provided, use it.
   Otherwise create a fresh one (optionally from :registry)."
-  [{:keys [analysis registry]}]
+  [{:keys [analysis registry] :as opts}]
   (cond
     analysis analysis
-    registry (make-analysis registry)
-    :else    (make-analysis)))
+    :else (make-analysis (or registry (registry/default-registry)) opts)))
 
 (defn analyze-expr
   "Analyze an S-expression and return its effect level.
