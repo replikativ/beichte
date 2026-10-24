@@ -95,7 +95,20 @@ many functions, create a context to reuse cached var analysis:
 ;; With custom registry
 (let [ctx (b/make-context {:registry my-registry})]
   ...)
+
+;; Compiler-owned IR: declared contracts only, no unowned source expansion
+(let [ctx (b/make-context {:registry my-registry :source-resolver nil})]
+  (b/analyze '(unknown-helper x) ctx)) ;; => :io
 ```
+
+The default source resolver reads function declarations from a Var's file and
+line. Non-function declarations (including protocols and types) are rejected
+before analysis, and reader evaluation is disabled. Function bodies can still
+expand macros; this facility is not a sandbox or proof that the text corresponds
+to the current Var root. Compilers needing that guarantee should disable fallback
+source lookup and supply owned expressions or declared registry contracts.
+A custom `:source-resolver` may provide a Var-to-source-string function; returning
+nil makes an unknown Var conservative (`:io`).
 
 ## How It Works
 

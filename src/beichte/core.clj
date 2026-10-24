@@ -51,12 +51,13 @@
   For compiler pipelines, create one context per pass and reuse it.
 
   Options:
-    :registry — custom effect registry (default: default-registry)"
+    :registry — custom effect registry (default: default-registry)
+    :source-resolver — Var -> function source string (default: source-var).
+      Explicit nil disables fallback source expansion; unknown Vars are :io.
+      Source text is not authenticated against a Var's current root."
   ([] (ana/make-analysis))
-  ([{:keys [registry]}]
-   (if registry
-     (ana/make-analysis registry)
-     (ana/make-analysis))))
+  ([{:keys [registry] :as options}]
+   (ana/make-analysis (or registry (registry/default-registry)) options)))
 
 ;; ================================================================
 ;; Primary API
